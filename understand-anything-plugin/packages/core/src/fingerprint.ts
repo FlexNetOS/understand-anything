@@ -1,8 +1,16 @@
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { StructuralAnalysis } from "./types.js";
 import type { PluginRegistry } from "./plugins/registry.js";
+
+/**
+ * Canonical on-disk location for the fingerprint store, relative to a
+ * project root analyzed by `/understand-anything:understand`. The Phase-1
+ * scanner writes other artifacts to `.understand-anything/`, so the
+ * fingerprint store lives in the same directory for discoverability.
+ */
+export const FINGERPRINT_STORE_PATH = ".understand-anything/fingerprints.json";
 
 // ---- Fingerprint types ----
 
@@ -246,9 +254,33 @@ export function compareFingerprints(
 }
 
 /**
+ * Probe a path on disk; return true iff it is a regular file we can read.
+ *
+ * The Phase-1 project-scanner can occasionally emit directory stubs as
+ * `file:` entries in `scan-result.json#/files[]` (e.g. when an extractor
+ * tags a directory whose contents weren't enumerable). Calling
+ * `readFileSync` on a directory throws `EISDIR`, which used to crash the
+ * fingerprint baseline halfway through. We now skip them silently — the
+ * caller will see the dropped count in `analyzeChanges`'s output or via
+ * the size of the returned `files` map.
+ */
+function isReadableFile(absolutePath: string): boolean {
+  try {
+    if (!existsSync(absolutePath)) return false;
+    return statSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Build a fingerprint store for a set of files.
  * Files without tree-sitter support get content-hash-only fingerprints
  * (conservative: any change is treated as STRUCTURAL).
+ *
+ * Paths that don't resolve to a regular file (directories, broken symlinks,
+ * deleted files) are skipped silently — the returned store's `files` map
+ * size will be smaller than `filePaths.length` in that case.
  */
 export function buildFingerprintStore(
   projectDir: string,
@@ -260,7 +292,7 @@ export function buildFingerprintStore(
 
   for (const filePath of filePaths) {
     const absolutePath = join(projectDir, filePath);
-    if (!existsSync(absolutePath)) continue;
+    if (!isReadableFile(absolutePath)) continue;
 
     const content = readFileSync(absolutePath, "utf-8");
     const analysis = registry.analyzeFile(filePath, content);
@@ -310,7 +342,10 @@ export function analyzeChanges(
   for (const filePath of changedFiles) {
     const absolutePath = join(projectDir, filePath);
     const existedBefore = filePath in existingStore.files;
-    const existsNow = existsSync(absolutePath);
+    // Treat a directory at this path the same as a missing file — it cannot
+    // be analyzed as source. This guards against the same scanner-stub
+    // edge case `buildFingerprintStore` handles.
+    const existsNow = isReadableFile(absolutePath);
 
     // File was deleted
     if (!existsNow) {
@@ -382,4 +417,55 @@ export function analyzeChanges(
     cosmeticOnlyFiles,
     unchangedFiles,
   };
+}
+
+// ---- Persistence helpers ----
+
+/**
+ * Resolve the canonical fingerprint-store path for a project.
+ *
+ * Exposed so consumers (test harnesses, doctor scripts, alternate
+ * pipelines) can locate the file without re-deriving the constant.
+ */
+export function fingerprintStorePath(projectDir: string): string {
+  return join(projectDir, FINGERPRINT_STORE_PATH);
+}
+
+/**
+ * Persist a fingerprint store to its canonical location under the project's
+ * `.understand-anything/` directory. Creates the parent directory if it
+ * doesn't exist yet (Phase-7 may run before any other artifact has landed
+ * in `.understand-anything/`, e.g. during a custom rebuild that skipped
+ * Phase 1).
+ *
+ * Returns the absolute path written to.
+ *
+ * The JSON is indented for readability — fingerprint stores are typically
+ * small enough (low single-digit MB for thousands of files) that the size
+ * cost is negligible and the diffability is valuable.
+ */
+export function saveFingerprints(
+  projectDir: string,
+  store: FingerprintStore,
+): string {
+  const outPath = fingerprintStorePath(projectDir);
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, JSON.stringify(store, null, 2));
+  return outPath;
+}
+
+/**
+ * Load a previously-persisted fingerprint store for a project. Returns
+ * `null` if no store exists yet — callers should treat that as
+ * "no baseline, build a fresh one" rather than an error.
+ *
+ * Throws if the file exists but cannot be parsed: a corrupt baseline is
+ * worse than no baseline, and silently rebuilding would mask the underlying
+ * issue (truncated write, disk full, etc.).
+ */
+export function loadFingerprints(projectDir: string): FingerprintStore | null {
+  const inPath = fingerprintStorePath(projectDir);
+  if (!existsSync(inPath)) return null;
+  const raw = readFileSync(inPath, "utf-8");
+  return JSON.parse(raw) as FingerprintStore;
 }

@@ -5,23 +5,40 @@ import {
   extractFileFingerprint,
   compareFingerprints,
   analyzeChanges,
+  buildFingerprintStore,
+  saveFingerprints,
+  loadFingerprints,
+  fingerprintStorePath,
+  FINGERPRINT_STORE_PATH,
   type FileFingerprint,
   type FingerprintStore,
 } from "../fingerprint.js";
 
-// Mock fs and path for analyzeChanges
+// Mock fs for analyzeChanges, buildFingerprintStore, saveFingerprints, and
+// loadFingerprints. Anything fingerprint.ts pulls from node:fs needs to be
+// stubbed here so tests stay deterministic and don't touch the real disk.
 vi.mock("node:fs", () => ({
   readFileSync: vi.fn(),
+  writeFileSync: vi.fn(),
   existsSync: vi.fn(),
+  statSync: vi.fn(),
+  mkdirSync: vi.fn(),
 }));
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "node:fs";
 
 const mockedReadFileSync = vi.mocked(readFileSync);
+const mockedWriteFileSync = vi.mocked(writeFileSync);
 const mockedExistsSync = vi.mocked(existsSync);
+const mockedStatSync = vi.mocked(statSync);
+const mockedMkdirSync = vi.mocked(mkdirSync);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default statSync to "is regular file" so existing tests that only mock
+  // existsSync continue to pass under the new isReadableFile guard inside
+  // buildFingerprintStore + analyzeChanges. Individual tests can override.
+  mockedStatSync.mockReturnValue({ isFile: () => true } as any);
 });
 
 describe("contentHash", () => {
@@ -423,5 +440,172 @@ describe("analyzeChanges", () => {
 
     expect(result.deletedFiles).toHaveLength(0);
     expect(result.fileChanges).toHaveLength(0);
+  });
+
+  it("treats a directory at the path as a deleted file (no crash)", () => {
+    // Regression: the project-scanner can emit directory stubs as `file:` entries
+    // (e.g. `rust/types/idl` in the chroma codebase). Without the isReadableFile
+    // guard, buildFingerprintStore + analyzeChanges crashed with EISDIR. Now we
+    // treat it as if the file is gone — the right call since you can't analyze a
+    // directory as source.
+    mockedExistsSync.mockReturnValue(true);
+    mockedStatSync.mockReturnValue({ isFile: () => false } as any);
+
+    const result = analyzeChanges("/project", ["src/utils.ts"], existingStore, mockRegistry);
+
+    expect(result.deletedFiles).toContain("src/utils.ts");
+    expect(result.fileChanges[0].changeLevel).toBe("STRUCTURAL");
+    expect(result.fileChanges[0].details).toContain("file deleted");
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// buildFingerprintStore
+// ──────────────────────────────────────────────────────────────────────
+
+describe("buildFingerprintStore", () => {
+  const mockRegistry = {
+    analyzeFile: vi.fn(),
+  } as any;
+
+  beforeEach(() => {
+    mockRegistry.analyzeFile.mockReset();
+  });
+
+  it("fingerprints regular files and skips directories without crashing", () => {
+    // src/a.ts is a regular file, rust/types/idl is a directory stub (the
+    // chroma regression). The function should fingerprint a.ts and silently
+    // skip idl, returning a store with exactly one file entry.
+    mockedExistsSync.mockImplementation(() => true);
+    mockedStatSync.mockImplementation((p: any) => ({
+      isFile: () => !String(p).endsWith("rust/types/idl"),
+    } as any));
+    mockedReadFileSync.mockReturnValue("const x = 1;\n");
+    mockRegistry.analyzeFile.mockReturnValue({
+      functions: [{ name: "x", lineRange: [1, 1], params: [] }],
+      classes: [],
+      imports: [],
+      exports: [{ name: "x", lineNumber: 1 }],
+    });
+
+    const store = buildFingerprintStore(
+      "/project",
+      ["src/a.ts", "rust/types/idl"],
+      mockRegistry,
+      "abc123",
+    );
+
+    expect(Object.keys(store.files)).toEqual(["src/a.ts"]);
+    expect(store.gitCommitHash).toBe("abc123");
+    expect(store.version).toBe("1.0.0");
+  });
+
+  it("skips paths whose statSync throws (broken symlinks etc.)", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedStatSync.mockImplementation(() => {
+      throw new Error("ENOENT");
+    });
+
+    const store = buildFingerprintStore(
+      "/project",
+      ["dangling-symlink"],
+      mockRegistry,
+      "abc",
+    );
+
+    expect(Object.keys(store.files)).toHaveLength(0);
+  });
+
+  it("falls back to content-hash-only fingerprint when registry has no parser", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedStatSync.mockReturnValue({ isFile: () => true } as any);
+    mockedReadFileSync.mockReturnValue("garbled binary content");
+    mockRegistry.analyzeFile.mockReturnValue(null);
+
+    const store = buildFingerprintStore(
+      "/project",
+      ["data/blob.bin"],
+      mockRegistry,
+      "abc",
+    );
+
+    const fp = store.files["data/blob.bin"];
+    expect(fp).toBeDefined();
+    expect(fp.hasStructuralAnalysis).toBe(false);
+    expect(fp.contentHash).toBe(contentHash("garbled binary content"));
+    expect(fp.functions).toHaveLength(0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// saveFingerprints / loadFingerprints
+// ──────────────────────────────────────────────────────────────────────
+
+describe("saveFingerprints / loadFingerprints", () => {
+  const sampleStore: FingerprintStore = {
+    version: "1.0.0",
+    gitCommitHash: "deadbeef",
+    generatedAt: "2026-05-13T00:00:00.000Z",
+    files: {
+      "src/a.ts": {
+        filePath: "src/a.ts",
+        contentHash: "h1",
+        functions: [],
+        classes: [],
+        imports: [],
+        exports: [],
+        totalLines: 5,
+        hasStructuralAnalysis: true,
+      },
+    },
+  };
+
+  beforeEach(() => {
+    mockedWriteFileSync.mockReset();
+    mockedMkdirSync.mockReset();
+  });
+
+  it("FINGERPRINT_STORE_PATH points at the canonical .understand-anything/ location", () => {
+    expect(FINGERPRINT_STORE_PATH).toBe(".understand-anything/fingerprints.json");
+  });
+
+  it("fingerprintStorePath joins project root with the canonical location", () => {
+    expect(fingerprintStorePath("/some/project")).toBe(
+      "/some/project/.understand-anything/fingerprints.json",
+    );
+  });
+
+  it("saveFingerprints creates the directory and writes JSON-formatted store", () => {
+    const out = saveFingerprints("/project", sampleStore);
+
+    expect(out).toBe("/project/.understand-anything/fingerprints.json");
+    expect(mockedMkdirSync).toHaveBeenCalledWith(
+      "/project/.understand-anything",
+      { recursive: true },
+    );
+    expect(mockedWriteFileSync).toHaveBeenCalledOnce();
+    const [, contents] = mockedWriteFileSync.mock.calls[0];
+    const parsed = JSON.parse(contents as string);
+    expect(parsed).toEqual(sampleStore);
+  });
+
+  it("loadFingerprints returns null when no baseline exists yet", () => {
+    mockedExistsSync.mockReturnValue(false);
+    expect(loadFingerprints("/project")).toBeNull();
+  });
+
+  it("loadFingerprints round-trips a previously saved store", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue(JSON.stringify(sampleStore));
+
+    const loaded = loadFingerprints("/project");
+    expect(loaded).toEqual(sampleStore);
+  });
+
+  it("loadFingerprints throws on corrupt JSON (better than silent rebuild)", () => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedReadFileSync.mockReturnValue("{not valid json");
+
+    expect(() => loadFingerprints("/project")).toThrow();
   });
 });

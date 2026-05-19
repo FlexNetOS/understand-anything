@@ -1,0 +1,89 @@
+{
+  "updatedAt": "2026-05-13T06:44:05.684Z",
+  "missions": [
+    {
+      "id": "session:df86a28d-fcf5-4e57-880a-ab88e345feae:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-05-13T06:37:18.894Z",
+      "updatedAt": "2026-05-13T06:44:05.684Z",
+      "status": "done",
+      "workerCount": 3,
+      "taskCounts": {
+        "total": 3,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 0,
+        "completed": 3,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "understand-anything:assemble-reviewer:a6e1b94",
+          "role": "understand-anything:assemble-reviewer",
+          "ownership": "a6e1b949541208da2",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-05-13T06:39:44.205Z"
+        },
+        {
+          "name": "understand-anything:architecture-analyzer:a3e1ebe",
+          "role": "understand-anything:architecture-analyzer",
+          "ownership": "a3e1ebe5f8f6c17e8",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-05-13T06:40:52.372Z"
+        },
+        {
+          "name": "understand-anything:tour-builder:ab6581b",
+          "role": "understand-anything:tour-builder",
+          "ownership": "ab6581bac9a092ae7",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-05-13T06:44:05.684Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-stop:a6e1b949541208da2:2026-05-13T06:39:44.205Z",
+          "at": "2026-05-13T06:39:44.205Z",
+          "kind": "completion",
+          "agent": "understand-anything:assemble-reviewer:a6e1b94",
+          "detail": "completed",
+          "sourceKey": "session-stop:a6e1b949541208da2"
+        },
+        {
+          "id": "session-stop:a3e1ebe5f8f6c17e8:2026-05-13T06:40:52.372Z",
+          "at": "2026-05-13T06:40:52.372Z",
+          "kind": "completion",
+          "agent": "understand-anything:architecture-analyzer:a3e1ebe",
+          "detail": "completed",
+          "sourceKey": "session-stop:a3e1ebe5f8f6c17e8"
+        },
+        {
+          "id": "session-start:ab6581bac9a092ae7:2026-05-13T06:41:46.355Z",
+          "at": "2026-05-13T06:41:46.355Z",
+          "kind": "update",
+          "agent": "understand-anything:tour-builder:ab6581b",
+          "detail": "started understand-anything:tour-builder:ab6581b",
+          "sourceKey": "session-start:ab6581bac9a092ae7"
+        },
+        {
+          "id": "session-stop:ab6581bac9a092ae7:2026-05-13T06:44:05.684Z",
+          "at": "2026-05-13T06:44:05.684Z",
+          "kind": "completion",
+          "agent": "understand-anything:tour-builder:ab6581b",
+          "detail": "completed",
+          "sourceKey": "session-stop:ab6581bac9a092ae7"
+        }
+      ]
+    }
+  ]
+}

@@ -910,6 +910,49 @@ def merge_and_normalize(batches: list[dict[str, Any]]) -> tuple[dict[str, Any], 
 
 # ── Imports-edge recovery from importMap ──────────────────────────────────
 
+# Prefixes that represent a single file-level artifact (one node per disk path).
+# Order matters: when a path appears under multiple prefixes (shouldn't happen in
+# a well-formed graph, but file-analyzer agents do occasionally double-classify
+# the same path), `file:` wins, then config, document, etc. Sub-file prefixes
+# (`function:`, `class:`, `module:`, `concept:`) are NEVER valid `imports`
+# targets — they're members of a file, not the file itself.
+_FILE_LEVEL_PREFIXES: tuple[str, ...] = (
+    "file", "config", "document", "service", "pipeline",
+    "table", "schema", "resource", "endpoint",
+)
+
+
+def _index_file_level_nodes_by_path(
+    nodes: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Build a `path → node_id` index across every file-level prefix.
+
+    The Phase-2 file-analyzer agents correctly emit JSON schemas as `schema:`
+    nodes, K8s manifests as `service:` / `resource:` nodes, Mintlify docs as
+    `document:` nodes, and so on (per the data sub-type routing in the agent
+    prompt). The importMap from Phase 1 only knows file paths — it has no
+    way to know which prefix each path will land under in the graph.
+
+    A `file:`-only lookup like the old recovery loop silently dropped every
+    `imports` edge whose target was a JSON schema, config, doc, or
+    infrastructure resource. The fix is to index by *path* and look up
+    whatever prefix the node actually has.
+    """
+    path_to_id: dict[str, str] = {}
+    for node in nodes:
+        nid = node.get("id", "")
+        if not isinstance(nid, str):
+            continue
+        for prefix in _FILE_LEVEL_PREFIXES:
+            marker = f"{prefix}:"
+            if nid.startswith(marker):
+                path = nid[len(marker):]
+                # setdefault: first hit wins per the prefix priority above.
+                path_to_id.setdefault(path, nid)
+                break
+    return path_to_id
+
+
 def recover_imports_from_scan(
     assembled: dict[str, Any],
     scan_result_path: Path,
@@ -920,6 +963,13 @@ def recover_imports_from_scan(
     file-analyzer agents are expected to transcribe those into edges 1:1
     but in practice drop ~25% of them on real projects (orchestrator-side
     batch construction loses entries, agent-side enumeration drops more).
+
+    Recovery looks up importMap entries across the full file-level prefix
+    taxonomy (file / config / document / service / pipeline / table /
+    schema / resource / endpoint), not just `file:`. A TS file legitimately
+    importing a `schemas/embedding_functions/*.json` schema therefore
+    keeps its `imports` edge to the `schema:` node, instead of being
+    silently dropped because no `file:` node existed at that path.
 
     Returns (recovered_count, report_lines).
     """
@@ -935,11 +985,8 @@ def recover_imports_from_scan(
     if not isinstance(import_map, dict):
         return 0, [f"  importMap recovery skipped — no importMap field in {scan_result_path.name}"]
 
-    # Build the set of file: node ids actually present in the assembled graph.
-    file_node_ids: set[str] = set()
-    for node in assembled["nodes"]:
-        if node.get("type") == "file":
-            file_node_ids.add(node.get("id", ""))
+    # Build a path → node_id index across every file-level prefix, not just `file:`.
+    path_to_id = _index_file_level_nodes_by_path(assembled["nodes"])
 
     # Build the set of (source, target) imports edges already present.
     existing: set[tuple[str, str]] = set()
@@ -948,21 +995,22 @@ def recover_imports_from_scan(
             existing.add((edge.get("source", ""), edge.get("target", "")))
 
     recovered = 0
+    cross_prefix_recovered = 0  # subset of `recovered` where target prefix != file
     skipped_no_src_node = 0
     skipped_no_tgt_node = 0
     for src_path, targets in import_map.items():
         if not isinstance(targets, list):
             continue
-        src_id = f"file:{src_path}"
-        if src_id not in file_node_ids:
+        src_id = path_to_id.get(src_path)
+        if src_id is None:
             if targets:
                 skipped_no_src_node += 1
             continue
         for tgt_path in targets:
             if not isinstance(tgt_path, str) or not tgt_path:
                 continue
-            tgt_id = f"file:{tgt_path}"
-            if tgt_id not in file_node_ids:
+            tgt_id = path_to_id.get(tgt_path)
+            if tgt_id is None:
                 skipped_no_tgt_node += 1
                 continue
             if src_id == tgt_id:
@@ -979,21 +1027,28 @@ def recover_imports_from_scan(
             })
             existing.add((src_id, tgt_id))
             recovered += 1
+            if not tgt_id.startswith("file:"):
+                cross_prefix_recovered += 1
 
     lines: list[str] = []
     lines.append(
         f"  Recovered {recovered} `imports` edges from importMap "
         f"({len(import_map)} entries scanned)"
     )
+    if cross_prefix_recovered:
+        lines.append(
+            f"    of which {cross_prefix_recovered} targeted non-`file:` nodes "
+            f"(schema / config / document / service / resource / etc.)"
+        )
     if skipped_no_src_node:
         lines.append(
             f"  Skipped {skipped_no_src_node} importMap source files "
-            f"with no `file:` node in graph"
+            f"with no file-level node in graph"
         )
     if skipped_no_tgt_node:
         lines.append(
             f"  Skipped {skipped_no_tgt_node} importMap target paths "
-            f"with no `file:` node in graph"
+            f"with no file-level node in graph"
         )
     return recovered, lines
 

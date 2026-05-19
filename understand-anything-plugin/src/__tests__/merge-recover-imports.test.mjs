@@ -128,10 +128,10 @@ describe("merge-batch-graphs.py imports recovery", () => {
 
     const { assembled, stderr } = runMerge();
     expect(assembled.edges.filter((e) => e.type === "imports")).toHaveLength(0);
-    expect(stderr).toContain("Skipped 1 importMap source files with no `file:` node");
+    expect(stderr).toContain("Skipped 1 importMap source files with no file-level node");
   });
 
-  it("skips importMap targets that don't have a file: node", () => {
+  it("skips importMap targets that don't have a file-level node", () => {
     writeFileSync(
       join(intermediateDir, "batch-0.json"),
       JSON.stringify({
@@ -148,7 +148,7 @@ describe("merge-batch-graphs.py imports recovery", () => {
 
     const { assembled, stderr } = runMerge();
     expect(assembled.edges.filter((e) => e.type === "imports")).toHaveLength(0);
-    expect(stderr).toContain("Skipped 2 importMap target paths with no `file:` node");
+    expect(stderr).toContain("Skipped 2 importMap target paths with no file-level node");
   });
 
   it("works when scan-result.json is missing (incremental update path)", () => {

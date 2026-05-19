@@ -1,0 +1,6 @@
+{"t":0,"agent":"a6e1b94","agent_type":"understand-anything:assemble-reviewer","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a3e1ebe","agent_type":"understand-anything:architecture-analyzer","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a6e1b94","agent_type":"understand-anything:assemble-reviewer","event":"agent_stop","success":true,"duration_ms":145311}
+{"t":0,"agent":"a3e1ebe","agent_type":"understand-anything:architecture-analyzer","event":"agent_stop","success":true,"duration_ms":176531}
+{"t":0,"agent":"ab6581b","agent_type":"understand-anything:tour-builder","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"ab6581b","agent_type":"understand-anything:tour-builder","event":"agent_stop","success":true,"duration_ms":139329}

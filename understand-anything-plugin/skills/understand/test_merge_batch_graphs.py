@@ -9,7 +9,9 @@ Run from this directory:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -939,6 +941,267 @@ class MergeEdgeDirectionTests(unittest.TestCase):
         self.assertEqual(len(edges), 1)
         self.assertEqual(edges[0]["direction"], "bidirectional")
         self.assertEqual(edges[0]["weight"], 0.9)
+
+# ── Cross-prefix imports recovery ─────────────────────────────────────────
+#
+# Regression: the imports-recovery pass at the end of merge_and_normalize
+# previously only looked up importMap targets under the `file:` prefix.
+# JSON schemas (`schema:`), configs (`config:`), docs (`document:`), K8s
+# resources (`resource:`), etc. were all silently dropped. The chroma
+# codebase surfaced this with ~58 lost imports edges from schemaUtils.ts
+# files to embedding-function JSON schemas.
+
+
+def _write_scan(tmp_path: Path, import_map: dict[str, list[str]]) -> Path:
+    """Write a minimal scan-result.json containing only the importMap field."""
+    scan_path = tmp_path / "scan-result.json"
+    scan_path.write_text(json.dumps({"importMap": import_map}))
+    return scan_path
+
+
+class IndexFileLevelNodesByPathTests(unittest.TestCase):
+    """`_index_file_level_nodes_by_path` indexes every file-level prefix."""
+
+    def test_indexes_each_file_level_prefix_exactly_once(self) -> None:
+        nodes: list[dict[str, Any]] = [
+            {"id": "file:src/foo.ts"},
+            {"id": "config:tsconfig.json"},
+            {"id": "document:README.md"},
+            {"id": "service:Dockerfile"},
+            {"id": "pipeline:.github/workflows/ci.yml"},
+            {"id": "table:migrations/001.sql"},
+            {"id": "schema:schemas/foo.json"},
+            {"id": "resource:k8s/deployment.yaml"},
+            {"id": "endpoint:idl/foo.proto"},
+            # Sub-file nodes must be excluded — they're never valid imports targets.
+            {"id": "function:src/foo.ts:doThing"},
+            {"id": "class:src/foo.ts:MyClass"},
+        ]
+
+        index = mbg._index_file_level_nodes_by_path(nodes)
+
+        self.assertEqual(index["src/foo.ts"], "file:src/foo.ts")
+        self.assertEqual(index["tsconfig.json"], "config:tsconfig.json")
+        self.assertEqual(index["README.md"], "document:README.md")
+        self.assertEqual(index["Dockerfile"], "service:Dockerfile")
+        self.assertEqual(
+            index[".github/workflows/ci.yml"], "pipeline:.github/workflows/ci.yml"
+        )
+        self.assertEqual(index["migrations/001.sql"], "table:migrations/001.sql")
+        self.assertEqual(index["schemas/foo.json"], "schema:schemas/foo.json")
+        self.assertEqual(index["k8s/deployment.yaml"], "resource:k8s/deployment.yaml")
+        self.assertEqual(index["idl/foo.proto"], "endpoint:idl/foo.proto")
+        # Sub-file prefixes excluded — `function:src/foo.ts:doThing` must
+        # not collide with `file:src/foo.ts` in the index.
+        self.assertEqual(len(index), 9)
+
+    def test_file_prefix_wins_when_path_appears_under_multiple_prefixes(self) -> None:
+        # Defensive: well-formed graphs shouldn't double-classify, but if a
+        # file-analyzer agent ever emits both `file:foo.json` and
+        # `schema:foo.json`, the `file:` entry wins per the documented
+        # prefix priority.
+        nodes: list[dict[str, Any]] = [
+            {"id": "file:foo.json"},
+            {"id": "schema:foo.json"},
+        ]
+        index = mbg._index_file_level_nodes_by_path(nodes)
+        self.assertEqual(index["foo.json"], "file:foo.json")
+
+    def test_ignores_nodes_with_non_string_id(self) -> None:
+        nodes: list[dict[str, Any]] = [
+            {"id": 123},  # type: ignore[dict-item]
+            {"id": None},
+            {"id": "file:src/a.ts"},
+        ]
+        index = mbg._index_file_level_nodes_by_path(nodes)
+        self.assertEqual(index, {"src/a.ts": "file:src/a.ts"})
+
+
+class RecoverImportsFromScanCrossPrefixTests(unittest.TestCase):
+    """End-to-end behaviour of `recover_imports_from_scan` across prefixes."""
+
+    def _run(
+        self,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        import_map: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        assembled: dict[str, Any] = {"nodes": nodes, "edges": edges}
+        with tempfile.TemporaryDirectory() as tmp:
+            scan_path = _write_scan(Path(tmp), import_map)
+            recovered, lines = mbg.recover_imports_from_scan(assembled, scan_path)
+        return assembled, recovered, lines
+
+    def test_recovers_schema_target_under_schema_prefix(self) -> None:
+        # The chroma regression case, distilled to a single edge.
+        nodes: list[dict[str, Any]] = [
+            _file_node("clients/js/schemaUtils.ts"),
+            {
+                "id": "schema:schemas/openai.json",
+                "type": "schema",
+                "name": "openai.json",
+                "filePath": "schemas/openai.json",
+                "summary": "",
+                "tags": [],
+            },
+        ]
+        import_map = {"clients/js/schemaUtils.ts": ["schemas/openai.json"]}
+
+        assembled, recovered, lines = self._run(nodes, [], import_map)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(len(assembled["edges"]), 1)
+        edge = assembled["edges"][0]
+        self.assertEqual(edge["source"], "file:clients/js/schemaUtils.ts")
+        self.assertEqual(edge["target"], "schema:schemas/openai.json")
+        self.assertEqual(edge["type"], "imports")
+        self.assertTrue(edge["recoveredFromImportMap"])
+        self.assertTrue(any("targeted non-`file:` nodes" in line for line in lines))
+
+    def test_recovers_against_every_file_level_prefix(self) -> None:
+        nodes: list[dict[str, Any]] = [
+            _file_node("src/app.ts"),
+            {"id": "config:tsconfig.json", "type": "config"},
+            {"id": "document:README.md", "type": "document"},
+            {"id": "service:Dockerfile", "type": "service"},
+            {"id": "pipeline:.github/workflows/ci.yml", "type": "pipeline"},
+            {"id": "table:migrations/001.sql", "type": "table"},
+            {"id": "schema:schemas/foo.json", "type": "schema"},
+            {"id": "resource:k8s/deployment.yaml", "type": "resource"},
+            {"id": "endpoint:idl/foo.proto", "type": "endpoint"},
+        ]
+        import_map = {
+            "src/app.ts": [
+                "tsconfig.json",
+                "README.md",
+                "Dockerfile",
+                ".github/workflows/ci.yml",
+                "migrations/001.sql",
+                "schemas/foo.json",
+                "k8s/deployment.yaml",
+                "idl/foo.proto",
+            ],
+        }
+
+        assembled, recovered, _ = self._run(nodes, [], import_map)
+
+        self.assertEqual(recovered, 8)
+        target_ids = {e["target"] for e in assembled["edges"]}
+        self.assertEqual(
+            target_ids,
+            {
+                "config:tsconfig.json",
+                "document:README.md",
+                "service:Dockerfile",
+                "pipeline:.github/workflows/ci.yml",
+                "table:migrations/001.sql",
+                "schema:schemas/foo.json",
+                "resource:k8s/deployment.yaml",
+                "endpoint:idl/foo.proto",
+            },
+        )
+
+    def test_skips_targets_with_no_node_in_graph(self) -> None:
+        nodes: list[dict[str, Any]] = [_file_node("src/app.ts")]
+        import_map = {"src/app.ts": ["does/not/exist.ts"]}
+
+        assembled, recovered, lines = self._run(nodes, [], import_map)
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(len(assembled["edges"]), 0)
+        self.assertTrue(
+            any("Skipped 1 importMap target paths" in line for line in lines)
+        )
+
+    def test_idempotent_when_edge_already_present(self) -> None:
+        nodes: list[dict[str, Any]] = [
+            _file_node("src/a.ts"),
+            _file_node("src/b.ts"),
+        ]
+        edges: list[dict[str, Any]] = [
+            {
+                "source": "file:src/a.ts",
+                "target": "file:src/b.ts",
+                "type": "imports",
+                "direction": "forward",
+                "weight": 0.7,
+            }
+        ]
+        import_map = {"src/a.ts": ["src/b.ts"]}
+
+        assembled, recovered, _ = self._run(nodes, edges, import_map)
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(len(assembled["edges"]), 1)
+
+    def test_no_self_loops_even_when_path_matches(self) -> None:
+        nodes: list[dict[str, Any]] = [_file_node("src/self.ts")]
+        import_map = {"src/self.ts": ["src/self.ts"]}
+
+        assembled, recovered, _ = self._run(nodes, [], import_map)
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(len(assembled["edges"]), 0)
+
+    def test_recovery_report_omits_cross_prefix_line_when_irrelevant(self) -> None:
+        # Pure file:→file: recoveries shouldn't include the "of which N
+        # targeted non-`file:` nodes" subline.
+        nodes: list[dict[str, Any]] = [
+            _file_node("src/a.ts"),
+            _file_node("src/b.ts"),
+        ]
+        import_map = {"src/a.ts": ["src/b.ts"]}
+
+        _, recovered, lines = self._run(nodes, [], import_map)
+
+        self.assertEqual(recovered, 1)
+        self.assertFalse(any("targeted non-`file:` nodes" in line for line in lines))
+
+
+class RecoverImportsFromScanRobustnessTests(unittest.TestCase):
+    """Edge cases the pre-fix code handled correctly — ensure no regressions."""
+
+    def test_handles_missing_scan_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist.json"
+            recovered, lines = mbg.recover_imports_from_scan(
+                {"nodes": [], "edges": []}, missing
+            )
+        self.assertEqual(recovered, 0)
+        self.assertTrue(any("not found" in line for line in lines))
+
+    def test_handles_malformed_scan_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scan-result.json"
+            path.write_text("{ not valid json")
+            recovered, lines = mbg.recover_imports_from_scan(
+                {"nodes": [], "edges": []}, path
+            )
+        self.assertEqual(recovered, 0)
+        self.assertTrue(any("could not parse" in line for line in lines))
+
+    def test_handles_missing_import_map_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scan-result.json"
+            path.write_text(json.dumps({"files": []}))
+            recovered, lines = mbg.recover_imports_from_scan(
+                {"nodes": [], "edges": []}, path
+            )
+        self.assertEqual(recovered, 0)
+        self.assertTrue(any("no importMap" in line for line in lines))
+
+    def test_skips_non_list_target_value(self) -> None:
+        # importMap values must be lists — anything else is malformed.
+        nodes: list[dict[str, Any]] = [_file_node("src/a.ts")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scan-result.json"
+            path.write_text(
+                json.dumps({"importMap": {"src/a.ts": "src/b.ts"}})
+            )
+            recovered, _ = mbg.recover_imports_from_scan(
+                {"nodes": nodes, "edges": []}, path
+            )
+        self.assertEqual(recovered, 0)
 
 
 if __name__ == "__main__":
